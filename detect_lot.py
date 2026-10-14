@@ -52,6 +52,8 @@ def find_rows(m):
     """Tra ve list (quad, chieu_cao_trung_binh) cua cac dai do tim duoc, sap tren -> duoi."""
     H, W = m.shape
     cnts, hier = cv2.findContours(m, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
+    if hier is None:                       # anh khong co vach trang nao
+        return []
     rows = []
     for c, h in zip(cnts, hier[0]):
         if h[3] < 0:                       # chi lay contour "lo" ben trong vach

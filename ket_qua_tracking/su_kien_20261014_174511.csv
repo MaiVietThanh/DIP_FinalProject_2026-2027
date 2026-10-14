@@ -1,0 +1,45 @@
+﻿thoi_gian,khung_hinh,xe_id,su_kien,cong,day,x_mm,y_mm,ghi_chu
+2026-10-14 17:45:12,1,1,co_san,,tren,326.7,44.2,xe có sẵn khi bắt đầu chạy
+2026-10-14 17:45:12,1,2,co_san,,tren,278.3,39.5,xe có sẵn khi bắt đầu chạy
+2026-10-14 17:45:12,1,3,co_san,,duoi,34.4,139.4,xe có sẵn khi bắt đầu chạy
+2026-10-14 17:45:12,1,4,co_san,,duoi,315.4,134.1,xe có sẵn khi bắt đầu chạy
+2026-10-14 17:45:12,1,5,co_san,,tren,36.0,39.4,xe có sẵn khi bắt đầu chạy
+2026-10-14 17:45:12,1,6,co_san,,tren,218.1,43.6,xe có sẵn khi bắt đầu chạy
+2026-10-14 17:45:12,1,7,co_san,,tren,183.0,39.7,xe có sẵn khi bắt đầu chạy
+2026-10-14 17:45:12,1,8,co_san,,duoi,90.1,135.9,xe có sẵn khi bắt đầu chạy
+2026-10-14 17:45:12,1,9,co_san,,duoi,151.1,133.3,xe có sẵn khi bắt đầu chạy
+2026-10-14 17:45:12,1,10,co_san,,tren,107.9,43.8,xe có sẵn khi bắt đầu chạy
+2026-10-14 17:45:12,1,11,co_san,,duoi,209.2,139.5,xe có sẵn khi bắt đầu chạy
+2026-10-14 17:45:21,187,1,do,,tren,326.9,44.4,đứng yên 10 s trong dãy trên
+2026-10-14 17:45:21,187,2,do,,tren,278.7,39.2,đứng yên 10 s trong dãy trên
+2026-10-14 17:45:21,187,3,do,,duoi,34.8,139.5,đứng yên 10 s trong dãy dưới
+2026-10-14 17:45:21,187,4,do,,duoi,315.1,133.8,đứng yên 10 s trong dãy dưới
+2026-10-14 17:45:21,187,5,do,,tren,36.2,39.3,đứng yên 10 s trong dãy trên
+2026-10-14 17:45:21,187,6,do,,tren,218.1,43.6,đứng yên 10 s trong dãy trên
+2026-10-14 17:45:21,187,7,do,,tren,183.4,39.5,đứng yên 10 s trong dãy trên
+2026-10-14 17:45:21,187,8,do,,duoi,90.1,136.1,đứng yên 10 s trong dãy dưới
+2026-10-14 17:45:21,187,9,do,,duoi,151.1,133.5,đứng yên 10 s trong dãy dưới
+2026-10-14 17:45:21,187,10,do,,tren,108.3,44.0,đứng yên 10 s trong dãy trên
+2026-10-14 17:45:21,187,11,do,,duoi,209.3,139.5,đứng yên 10 s trong dãy dưới
+2026-10-14 17:45:34,507,12,xuat_hien,,,389.6,67.3,xe mới không đi qua ô cam (có thể bị mất dấu quá lâu)
+2026-10-14 17:45:34,507,13,xuat_hien,,,393.8,67.3,xe mới không đi qua ô cam (có thể bị mất dấu quá lâu)
+2026-10-14 17:45:35,534,3,roi_cho,,duoi,33.6,130.6,xe đang đỗ bị dời khỏi chỗ
+2026-10-14 17:45:35,535,5,roi_cho,,tren,39.3,29.8,xe đang đỗ bị dời khỏi chỗ
+2026-10-14 17:45:35,536,8,roi_cho,,duoi,88.8,127.6,xe đang đỗ bị dời khỏi chỗ
+2026-10-14 17:45:35,537,10,roi_cho,,tren,112.2,36.4,xe đang đỗ bị dời khỏi chỗ
+2026-10-14 17:45:35,539,1,roi_cho,,tren,331.7,50.9,xe đang đỗ bị dời khỏi chỗ
+2026-10-14 17:45:35,540,9,roi_cho,,duoi,149.8,125.2,xe đang đỗ bị dời khỏi chỗ
+2026-10-14 17:45:35,541,2,roi_cho,,tren,286.2,42.9,xe đang đỗ bị dời khỏi chỗ
+2026-10-14 17:45:35,541,7,roi_cho,,tren,190.9,35.2,xe đang đỗ bị dời khỏi chỗ
+2026-10-14 17:45:36,542,6,roi_cho,,tren,226.2,41.5,xe đang đỗ bị dời khỏi chỗ
+2026-10-14 17:45:39,606,12,roi_bai,,,389.1,67.3,xe rời khỏi bãi
+2026-10-14 17:45:39,606,13,roi_bai,,,393.4,67.5,xe rời khỏi bãi
+2026-10-14 17:45:48,819,1,do,,tren,326.4,45.2,đứng yên 10 s trong dãy trên
+2026-10-14 17:45:48,819,2,do,,tren,279.3,40.2,đứng yên 10 s trong dãy trên
+2026-10-14 17:45:48,819,3,do,,duoi,34.1,137.7,đứng yên 10 s trong dãy dưới
+2026-10-14 17:45:48,819,5,do,,tren,36.5,37.9,đứng yên 10 s trong dãy trên
+2026-10-14 17:45:48,819,6,do,,tren,218.8,44.5,đứng yên 10 s trong dãy trên
+2026-10-14 17:45:48,819,7,do,,tren,183.4,39.8,đứng yên 10 s trong dãy trên
+2026-10-14 17:45:48,819,8,do,,duoi,90.2,135.7,đứng yên 10 s trong dãy dưới
+2026-10-14 17:45:48,819,9,do,,duoi,151.8,133.5,đứng yên 10 s trong dãy dưới
+2026-10-14 17:45:48,819,10,do,,tren,109.1,44.1,đứng yên 10 s trong dãy trên
