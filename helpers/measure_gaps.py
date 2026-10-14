@@ -32,7 +32,11 @@ import sys
 import cv2
 import numpy as np
 
-from detect_lot import (LOT_H, LOT_W, PX_PER_MM, ROWS_MM, assign_rows,
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))   # thư mục chứa main.py, helpers/, weights/
+if ROOT not in sys.path:   # để chạy thẳng file này (python helpers/xxx.py) vẫn import được helpers.*
+    sys.path.insert(0, ROOT)
+
+from helpers.detect_lot import (LOT_H, LOT_W, PX_PER_MM, ROWS_MM, assign_rows,
                         find_rows, homography, line_mask, quad_of)
 
 S = 8                       # do phan giai mat phang do: 8 px / mm (0,125 mm / px)
@@ -227,7 +231,7 @@ def draw_masks(img, masks):
 # ---------------------------------------------------------------- main
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model", default="best.pt")
+    ap.add_argument("--model", default=os.path.join(ROOT, "weights", "best.pt"))
     ap.add_argument("--images", default="TEST")
     ap.add_argument("--gt", default=None, help="mac dinh: <images>/ground_truth_test.csv")
     ap.add_argument("--out", default="ket_qua_do")

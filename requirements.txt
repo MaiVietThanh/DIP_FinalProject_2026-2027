@@ -1,0 +1,13 @@
+# Thư viện cần để chạy main.py + helpers/ (Python 3.13, GPU NVIDIA)
+# Cài (uv): uv pip install -r requirements.txt --index-strategy unsafe-best-match   |   (pip): pip install -r requirements.txt
+#
+# torch bản CUDA 12.8 không có trên PyPI mặc định, nên lấy thêm từ index của PyTorch.
+# Nếu muốn cài torch riêng trước:
+#   uv pip install torch==2.11.0 torchvision==0.26.0 --index-url https://download.pytorch.org/whl/cu128
+--extra-index-url https://download.pytorch.org/whl/cu128
+
+torch==2.11.0+cu128
+torchvision==0.26.0+cu128
+ultralytics==8.4.170
+opencv-python==5.0.0.93
+numpy==2.5.2

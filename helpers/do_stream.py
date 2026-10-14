@@ -1,7 +1,7 @@
 """Đo tốc độ stream MJPEG của IP Webcam ở vài mức chất lượng JPEG (không chạy YOLO).
 
-Chạy:   uv run ./do_stream.py                       (URL lấy từ STREAM_URL trong track_gate.py)
-        uv run ./do_stream.py --source http://<ip>:8080/video --giay 6 --muc 90 70 50 30
+Chạy:   uv run ./helpers/do_stream.py                       (URL lấy từ STREAM_URL trong main.py)
+        uv run ./helpers/do_stream.py --source http://<ip>:8080/video --giay 6 --muc 90 70 50 30
 Mỗi mức in ra: số khung/giây điện thoại gửi về và băng thông (Mbit/s).
   - FPS tăng rõ khi hạ chất lượng, Mbit/s gần như không đổi -> nghẽn ở Wi-Fi
   - FPS gần như không đổi dù hạ chất lượng                  -> nghẽn ở điện thoại (camera/bộ nén)
@@ -9,10 +9,16 @@ Cuối cùng trả chất lượng về như lúc đầu.
 """
 import argparse
 import json
+import os
+import sys
 import time
 import urllib.request
 
-from track_gate import STREAM_URL, _request
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))   # thư mục chứa main.py, helpers/, weights/
+if ROOT not in sys.path:   # để chạy thẳng file này (python helpers/xxx.py) vẫn import được helpers.*
+    sys.path.insert(0, ROOT)
+
+from main import STREAM_URL, _request
 
 
 def measure(url, secs):

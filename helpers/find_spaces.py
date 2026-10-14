@@ -2,8 +2,8 @@
 
 Chạy:   python find_spaces.py --image duong_dan_anh.jpg
         python find_spaces.py --image thu_muc_anh/            (chạy cả thư mục)
-Tùy chọn: --model best.pt  --out ket_qua_cho_trong  --pad 5  --conf 0.5
-Cần cùng thư mục: detect_lot.py, measure_gaps.py (lấy hàm nắn ảnh), best.pt
+Tùy chọn: --model weights/best.pt  --out ket_qua_cho_trong  --pad 5  --conf 0.5
+Cần: helpers/detect_lot.py, helpers/measure_gaps.py (lấy hàm nắn ảnh), weights/best.pt
 
 Các bước (đúng theo đề cương giai đoạn 4):
   1. YOLO -> danh sách bounding box (x1, y1, x2, y2) của các xe.
@@ -26,12 +26,17 @@ Kết quả: <tên>_cho_trong.jpg (ảnh gốc) và <tên>_tren_xuong.jpg (ảnh
 import argparse
 import glob
 import os
+import sys
 
 import cv2
 import numpy as np
 
-from detect_lot import ROWS_MM, LOT_H, LOT_W
-from measure_gaps import lot_homography
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))   # thư mục chứa main.py, helpers/, weights/
+if ROOT not in sys.path:   # để chạy thẳng file này (python helpers/xxx.py) vẫn import được helpers.*
+    sys.path.insert(0, ROOT)
+
+from helpers.detect_lot import ROWS_MM, LOT_H, LOT_W
+from helpers.measure_gaps import lot_homography
 
 S = 8                       # phải trùng với S trong measure_gaps.py (px / mm trên mặt phẳng bãi)
 OPEN_MM = 3                 # kích thước kernel opening để bỏ nhiễu (mm)
@@ -149,6 +154,8 @@ def find_spaces(boxes, H, pad_mm=5, car_size_mm=None, s=S):
                 "gap_mm": (r_ - l + 1) / s,
                 "capacity": 1 + int((width - car_w) // (car_w + pad_mm)),
                 "slot_px": (cx - hw, cy - hh, cx + hw, cy + hh),
+                # ô chữ nhật phủ hết đoạn trống thật (dài = gap_mm, cao = 1 xe) để vẽ
+                "gap_px": (l, max(0, cy - hh), r_ + 1, min(raw_free.shape[0], cy + hh + 1)),
                 "region": region,
                 "rid": i,
             })
@@ -184,11 +191,12 @@ def draw(img, H, res):
             cv2.drawContours(top, cnts, -1, GREEN, 3)
             for c in cnts:
                 cv2.polylines(out, [to_img(c.reshape(-1, 2))], True, GREEN, lw)
-        x1, y1, x2, y2 = sp["slot_px"]
+        x1, y1, x2, y2 = sp["gap_px"]                                # ô xanh dài theo cả khe trống
         slot = [[x1, y1], [x2, y1], [x2, y2], [x1, y2]]
         cv2.rectangle(top, (x1, y1), (x2, y2), GREEN, 5)
         cv2.polylines(out, [to_img(slot)], True, GREEN, lw * 2)
-        label = f"#{k} {sp['gap_mm']:.0f}mm x{sp['capacity']}"
+        n = sp["capacity"]
+        label = f"#{k} {sp['gap_mm']:.0f}mm - fits {n} car" + ("s" if n > 1 else "")
         cv2.putText(top, label, (x1, max(30, y1 - 10)), cv2.FONT_HERSHEY_SIMPLEX, 1.0, GREEN, 3)
         p = to_img([[x1, y1]])[0]
         cv2.putText(out, label, (int(p[0]), int(p[1]) - 10), cv2.FONT_HERSHEY_SIMPLEX, lw / 2, GREEN, lw)
@@ -220,7 +228,7 @@ def process(path, model, a):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--image", required=True, help="1 ảnh hoặc 1 thư mục ảnh")
-    ap.add_argument("--model", default="best.pt")
+    ap.add_argument("--model", default=os.path.join(ROOT, "weights", "best.pt"))
     ap.add_argument("--out", default="ket_qua_cho_trong")
     ap.add_argument("--pad", type=float, default=5, help="khoảng đệm an toàn quanh mỗi xe (mm)")
     ap.add_argument("--conf", type=float, default=0.5)

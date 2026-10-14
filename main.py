@@ -1,13 +1,13 @@
 """Giai đoạn 5: theo dõi xe vào / đỗ / rời bãi trên stream IP Webcam (Full HD), chạy YOLO bằng GPU.
 
-Chạy:   uv run ./track_gate.py                                   (URL ở STREAM_URL)
-        uv run ./track_gate.py --source http://<ip>:8080/video   (nhập URL trực tiếp)
-Tùy chọn: --model best.pt  --conf 0.5  --imgsz 640  --pad 5  --do_yen 10  --mat_xe 3  --mat_xe_do 8
-          --mjpeg (bỏ qua H.264, chỉ dùng MJPEG)  --chat_luong 80
-Cần cùng thư mục: detect_lot.py, find_spaces.py, measure_gaps.py, best.pt. Cần torch bản CUDA.
+Chạy:   uv run ./main.py                                   (URL ở STREAM_URL)
+        uv run ./main.py --source http://<ip>:8080/video   (nhập URL trực tiếp)
+Tùy chọn: --model weights/best.pt  --conf 0.5  --imgsz 640  --pad 5  --do_yen 10  --mat_xe 3  --mat_xe_do 8
+          --h264 (thử RTSP H.264 trước rồi mới MJPEG)  --chat_luong 80
+Cấu trúc: main.py, helpers/ (detect_lot.py, find_spaces.py, measure_gaps.py), weights/best.pt. Cần torch bản CUDA.
 
-Stream: mặc định đọc H.264 qua RTSP của IP Webcam (rtsp://<ip>:8080/h264_ulaw.sdp, phần audio bị bỏ qua);
-link h264.sdp không audio của app hay treo nên chỉ thử sau. Không được thì tự chuyển sang MJPEG (/video).
+Stream: mặc định đọc MJPEG (/video, cùng luồng với web player của IP Webcam) vì đã đủ FPS và ổn định.
+--h264: thử RTSP H.264 trước (rtsp://<ip>:8080/h264_ulaw.sdp rồi h264.sdp), không được thì về MJPEG.
 Vài dòng "error while decoding MB" lúc mới kết nối là bình thường (chưa gặp keyframe).
 
 Khung bãi: lề giấy trắng bao quanh vùng in tối; tìm 4 góc vùng in rồi ánh xạ về kích thước đã đo
@@ -27,7 +27,7 @@ Các bước:
 
 YOLO chạy ở thread riêng trên khung MỚI NHẤT; cửa sổ hiện mọi khung của stream kèm kết quả gần nhất.
 Phím tắt: q = thoát, space = tạm dừng.
-Kết quả: ket_qua_tracking/su_kien_<ngày_giờ>.csv (nhật ký mỗi lần chạy, cạnh file track_gate.py).
+Kết quả: tracking_result/<ngày_giờ>.csv (nhật ký mỗi lần chạy, cạnh file track_gate.py).
 """
 import argparse
 import base64
@@ -45,15 +45,18 @@ from urllib.parse import unquote, urlsplit, urlunsplit
 import cv2
 import numpy as np
 
-from detect_lot import ROWS_MM
-from find_spaces import S, find_spaces
+HERE = os.path.dirname(os.path.abspath(__file__))   # thư mục chứa main.py
+if HERE not in sys.path:   # để import helpers/ dù chạy main.py từ thư mục nào
+    sys.path.insert(0, HERE)
 
-PHIEN_BAN = "2026-10-14 v5.3 (GPU + H264 ulaw mặc định + polygon)"   # in ra khi chạy để biết đang chạy bản nào
-STREAM_URL = "http://172.18.0.200:8080/video"   # <-- URL IP Webcam (có thể dạng http://user:pass@ip:8080/video)
+from helpers.detect_lot import ROWS_MM
+from helpers.find_spaces import S, find_spaces
+
+PHIEN_BAN = "2026-10-14 v5.6 (MJPEG mặc định + chống tay/bóng + ô trống vẽ dài theo khe)"   # in ra khi chạy để biết đang chạy bản nào
+STREAM_URL = "http://192.168.1.9:8080/video"   # <-- URL IP Webcam (có thể dạng http://user:pass@ip:8080/video)
 FULL_HD = (1920, 1080)
 RED, GREEN, YELLOW, CYAN, MAGENTA, WHITE = (0, 0, 255), (0, 200, 0), (0, 220, 255), (255, 200, 0), (255, 0, 255), (255, 255, 255)
 BLUE = (255, 90, 0)
-HERE = os.path.dirname(os.path.abspath(__file__))
 
 
 class Rate:
@@ -167,8 +170,8 @@ class StreamReader(threading.Thread):
             return (None, 0) if self.frame is None else (self.frame, self.fid)
 
 
-def stream_urls(url, h264=True):
-    """Danh sách URL thử: RTSP H.264 + ulaw rồi H.264 qua TCP (trừ khi --mjpeg); sau đó MJPEG.
+def stream_urls(url, h264=False):
+    """Danh sách URL thử: RTSP H.264 + ulaw rồi H.264 qua TCP (chỉ khi --h264); sau đó MJPEG.
     Đuôi " (tcp)" / " (udp)" là cách truyền RTSP, được tách ra trước khi mở."""
     p = urlsplit(url)
     base = url.split("/video")[0].rstrip("/")
@@ -370,6 +373,21 @@ def car_shape(seg, box):
     return hull, np.float32(cv2.boxPoints(rc))
 
 
+CAR_SHORT_MM = (18.0, 75.0)     # cạnh ngắn hợp lệ của box xe (mm); xe thật ~28-37, box thẳng khi xe xoay 45° ~70
+CAR_LONG_MM = (45.0, 115.0)     # cạnh dài hợp lệ (mm); xe thật ~68
+
+
+def car_like(q):
+    """Loại phát hiện không giống xe: mảnh tay/bóng mảnh dài, khối tay + xe dính nhau quá to,
+    hoặc tâm nằm ngoài tờ giấy (tay thò vào từ mép)."""
+    a, b = np.hypot(*(q[1] - q[0])), np.hypot(*(q[2] - q[1]))
+    short, long_ = min(a, b), max(a, b)
+    c = q.mean(0)
+    lo, hi = PRINT_MM.min(0), PRINT_MM.max(0)
+    return (CAR_SHORT_MM[0] <= short <= CAR_SHORT_MM[1] and CAR_LONG_MM[0] <= long_ <= CAR_LONG_MM[1]
+            and lo[0] <= c[0] <= hi[0] and lo[1] <= c[1] <= hi[1])
+
+
 def load_model(a):
     """YOLO trên GPU NVIDIA (torch CUDA), FP16. Không có CUDA thì dừng và in cách cài."""
     import torch
@@ -435,21 +453,30 @@ class ParkingRegistry:
     nên cầm xe di chuyển không bị đổi ID."""
 
     TIGHT_MM = 8.0          # lệch <= mức này coi là cùng chỗ (nhiễu mask)
+    HOLD_MM = 15.0          # xe đang đỗ: phát hiện lệch <= mức này vẫn là xe đó đứng yên (tay/bóng làm mask lệch)
     STILL_MM = 5.0          # đứng yên nếu tâm không lệch quá mức này
     MOVE_GATE_MM = 70.0     # xe đang chạy: ghép với phát hiện trong bán kính này (theo khung liền kề)
-    PARK_PICK_MM = 45.0     # xe đang đỗ: phát hiện lệch 8..45 mm quanh chỗ đỗ = xe đang bị dời đi
+    PARK_PICK_MM = 45.0     # xe đang đỗ: phát hiện lệch 15..45 mm quanh chỗ đỗ = xe đang bị dời đi
+    DUP_MM = 25.0           # phát hiện thừa có tâm gần xe đã có hơn mức này = mảnh tay/bóng dính vào xe, bỏ
+    CAND_MM = 40.0          # ứng viên xe mới: ghép giữa các khung trong bán kính này
+    CAND_HITS = 3           # ứng viên phải được thấy ở >= ngần này khung YOLO ...
+    CAND_S = 0.3            # ... tồn tại >= ngần này giây ...
+    CAND_RATIO = 0.7        # ... và có mặt ở >= 70% số khung kể từ lúc xuất hiện thì mới cấp ID (tay chập chờn thì không)
+    CAND_TTL = 0.6          # ứng viên không thấy lại quá ngần này giây thì bỏ
 
     def __init__(self, park_s, lost_s, lost_park_s, startup_s, log_event):
         self.park_s, self.lost_s, self.lost_park_s, self.startup_s = park_s, lost_s, lost_park_s, startup_s
         self.cars, self.next_id, self.t0 = {}, 1, None
+        self.cands = []                            # ứng viên xe mới chưa cấp ID: {c, det, hits, t0, t}
         self.log = log_event                       # log(xe, su_kien, cong, ghi_chu)
         self.n_in = self.n_out = 0
 
-    def _new(self, det, now):
+    def _new(self, det, now, t_first=None):
         if self.t0 is None:
             self.t0 = now
         g = gate_at(det["c"])
-        origin = "co_san" if now - self.t0 < self.startup_s and g is None else (g or "xuat_hien")
+        t_first = now if t_first is None else t_first
+        origin = "co_san" if t_first - self.t0 < self.startup_s and g is None else (g or "xuat_hien")
         car = Car(self.next_id, det, now, origin)
         self.cars[car.id] = car
         self.next_id += 1
@@ -488,24 +515,29 @@ class ParkingRegistry:
 
         dist = lambda c, j: float(np.hypot(*(dets[j]["c"] - c.c)))
         matched = set()
-        # 1) mọi xe (đỗ hoặc chạy) có phát hiện gần như trùng chỗ
-        for car, j in take([(c, j, dist(c, j)) for c in cars for j in free], self.TIGHT_MM):
+        # 0) xe đang đỗ: phát hiện lệch ít (tay che / bóng đổ làm mask xê dịch) -> vẫn đứng yên, giữ box đã lưu.
+        #    Làm TRƯỚC để xe khác (hay "xe ma" do tay) không giành mất phát hiện của xe đang đỗ.
+        parked = [c for c in cars if c.state == "da_do"]
+        for car, j in take([(c, j, dist(c, j)) for c in parked for j in free], self.HOLD_MM):
             matched.add(car.id)
-            if car.state == "da_do":
-                car.t_seen = now                  # vẫn ở chỗ đỗ: giữ nguyên box đã lưu
-            else:
-                car.update(dets[j], now)
-        # 2) xe đang chạy (vừa thấy ở khung trước) -> phát hiện trong bán kính MOVE_GATE_MM
-        moving = [c for c in cars if c.id not in matched and c.state == "di_chuyen" and now - c.t_seen < 1.0]
-        for car, j in take([(c, j, dist(c, j)) for c in moving for j in free], self.MOVE_GATE_MM):
+            car.t_seen = now
+        # 1) xe đang chạy có phát hiện gần như trùng chỗ
+        moving = [c for c in cars if c.id not in matched and c.state == "di_chuyen"]
+        for car, j in take([(c, j, dist(c, j)) for c in moving for j in free], self.TIGHT_MM):
             matched.add(car.id)
             car.update(dets[j], now)
-        # 3) xe đang đỗ mà có phát hiện lệch khỏi chỗ đỗ một chút -> đang bị dời đi
-        parked = [c for c in cars if c.id not in matched and c.state == "da_do"]
-        for car, j in take([(c, j, dist(c, j)) for c in parked for j in free], self.PARK_PICK_MM):
+        # 2) xe đang chạy (vừa thấy < 1 s) trong bán kính MOVE_GATE_MM và xe đang đỗ bị lệch HOLD..PARK_PICK mm
+        #    ghép CHUNG theo khoảng cách: phát hiện thuộc về xe gần nhất, không ưu tiên xe đang chạy nữa
+        pairs = [(c, j, dist(c, j)) for c in cars if c.id not in matched for j in free
+                 if (c.state == "di_chuyen" and now - c.t_seen < 1.0 and dist(c, j) <= self.MOVE_GATE_MM)
+                 or (c.state == "da_do" and dist(c, j) <= self.PARK_PICK_MM)]
+        for car, j in take(pairs, self.MOVE_GATE_MM):
             matched.add(car.id)
-            self._start_moving(car, dets[j], now, "xe đang đỗ bị dời khỏi chỗ")
-        # 4) phát hiện còn thừa: nhận lại xe vừa mất dấu gần đó (bán kính tăng theo thời gian mất dấu)
+            if car.state == "da_do":
+                self._start_moving(car, dets[j], now, "xe đang đỗ bị dời khỏi chỗ")
+            else:
+                car.update(dets[j], now)
+        # 3) phát hiện còn thừa: nhận lại xe vừa mất dấu gần đó (bán kính tăng theo thời gian mất dấu)
         lost = [c for c in cars if c.id not in matched]
         pairs = []
         for c in lost:
@@ -517,10 +549,32 @@ class ParkingRegistry:
                 self._start_moving(car, dets[j], now, "xe đang đỗ được nhấc lên đặt chỗ khác")
             else:
                 car.update(dets[j], now)
-        # 5) phát hiện không thuộc xe nào -> xe mới
-        for j in list(free):
-            self._new(dets[j], now)
-        # 6) chuyển trạng thái
+        # 4) phát hiện không thuộc xe nào: bỏ mảnh dính sát xe đã có (2 xe thật không thể cách tâm < DUP_MM),
+        #    phần còn lại thành ứng viên; chỉ cấp ID khi ứng viên được thấy đủ CAND_HITS khung / CAND_S giây
+        rest = [j for j in free if all(dist(c, j) > self.DUP_MM for c in self.cars.values())]
+        used = set()
+        for j in rest:
+            c_j = dets[j]["c"]
+            best = min((k for k in range(len(self.cands)) if k not in used),
+                       key=lambda k: np.hypot(*(self.cands[k]["c"] - c_j)), default=None)
+            if best is not None and np.hypot(*(self.cands[best]["c"] - c_j)) <= self.CAND_MM:
+                cd = self.cands[best]
+                cd.update(c=c_j, det=dets[j], t=now, hits=cd["hits"] + 1)
+            else:
+                self.cands.append({"c": c_j, "det": dets[j], "hits": 1, "n": 0, "t0": now, "t": now})
+                best = len(self.cands) - 1
+            used.add(best)
+        keep = []
+        for cd in self.cands:
+            cd["n"] += 1                                    # số khung YOLO kể từ lúc ứng viên xuất hiện
+            ratio = cd["hits"] / cd["n"]
+            if cd["t"] == now and cd["hits"] >= self.CAND_HITS and now - cd["t0"] >= self.CAND_S \
+                    and ratio >= self.CAND_RATIO:
+                self._new(cd["det"], now, cd["t0"])
+            elif now - cd["t"] <= self.CAND_TTL and (cd["n"] < 5 or ratio >= 0.5):
+                keep.append(cd)
+        self.cands = keep
+        # 5) chuyển trạng thái
         for car in list(self.cars.values()):
             gone = now - car.t_seen
             if car.state == "di_chuyen":
@@ -530,7 +584,8 @@ class ParkingRegistry:
                         car.still_for(now, self.STILL_MM) >= self.park_s:
                     car.state, car.t_park = "da_do", now
                     self.log(car, "do", "", f"đứng yên {self.park_s:.0f} s trong dãy {'trên' if in_row(car.c) == 0 else 'dưới'}")
-                elif gone > self.lost_s:
+                # xe chỉ rời bãi qua ô cam: mất dấu giữa bãi (tay cầm che) thì chờ lâu như xe đang đỗ
+                elif gone > (self.lost_s if gate_at(car.c, margin=25.0) else self.lost_park_s):
                     self._leave(car, now)
             elif gone > self.lost_park_s:
                 self._leave(car, now)
@@ -543,6 +598,9 @@ class ParkingRegistry:
 
     def shift(self, dt):
         """Dời mốc thời gian của mọi xe đi dt giây (sau khi tạm dừng detect)."""
+        for cd in self.cands:
+            cd["t0"] += dt
+            cd["t"] += dt
         for car in self.cars.values():
             car.t_seen += dt
             car.hist = deque((t + dt, c) for t, c in car.hist)
@@ -582,6 +640,8 @@ class Detector:
             for i, box in enumerate(r.boxes.xyxy.cpu().numpy()):
                 hull, quad = car_shape(segs[i] if i < len(segs) else None, box)
                 q = quad / REC_PX_MM + lo
+                if not car_like(q):
+                    continue
                 dets.append({"quad": q, "hull": hull / REC_PX_MM + lo, "c": q.mean(0)})
         return dets
 
@@ -609,7 +669,7 @@ class Detector:
                 quads = [to_img(c.quad * S, H) for c in self.reg.cars.values() if self.reg.still_now(c, now)]
                 s = self.SPACE_S
                 res = find_spaces(quads, H, self.a.pad, s=s)
-                self.spaces = [{"slot_mm": np.float32(sp["slot_px"]) / s, "gap_mm": sp["gap_mm"],
+                self.spaces = [{"slot_mm": np.float32(sp["gap_px"]) / s, "gap_mm": sp["gap_mm"],
                                 "capacity": sp["capacity"]} for sp in res["spaces"]]
                 self.t_space = time.time()
         self.det_rate.tick()
@@ -706,10 +766,13 @@ def draw_overlay(out, snap, info, lw):
         busy = {gate_at(c["hull"].mean(0), margin=0) for c in snap["cars"]}
         for g, name in gates:                    # tên ô cam chỉ ghi khi không có xe trong ô
             label_inside(out, g, [] if name in busy else [name], MAGENTA, lw, dim=0.8)
-        for k, sp in enumerate(spaces, 1):
+        for k, sp in enumerate(spaces, 1):       # ô xanh phủ hết đoạn trống: số thứ tự, độ dài khe, số xe đặt được
             x1, y1, x2, y2 = sp["slot_mm"]
-            label_inside(out, img([[x1, y1], [x2, y1], [x2, y2], [x1, y2]]),
-                         [f"#{k}", f"{sp['gap_mm']:.0f}mm", f"x{sp['capacity']}"], GREEN, lw)
+            n = sp["capacity"]
+            car_s = f"{n} car" + ("s" if n > 1 else "")    # cv2.putText không viết được dấu tiếng Việt
+            text = [f"#{k}  {sp['gap_mm']:.0f}mm", f"fits {car_s}"] if sp["gap_mm"] >= 90 else \
+                [f"#{k}", f"{sp['gap_mm']:.0f}mm", car_s]
+            label_inside(out, img([[x1, y1], [x2, y1], [x2, y2], [x1, y2]]), text, GREEN, lw)
         for car in snap["cars"]:
             parked = car["state"] == "da_do"
             new = car["origin"].startswith("cong")
@@ -736,12 +799,12 @@ def draw_overlay(out, snap, info, lw):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--source", default=STREAM_URL, help="URL IP Webcam, vd http://<ip>:8080/video")
-    ap.add_argument("--mjpeg", action="store_true", help="bỏ qua H.264 (RTSP), chỉ đọc MJPEG /video")
-    ap.add_argument("--model", default="best.pt")
+    ap.add_argument("--h264", action="store_true", help="thử RTSP H.264 trước, không được mới đọc MJPEG /video (mặc định: chỉ MJPEG)")
+    ap.add_argument("--model", default=os.path.join(HERE, "weights", "best.pt"))
     ap.add_argument("--conf", type=float, default=0.5)
     ap.add_argument("--imgsz", type=int, default=640, help="cỡ ảnh đưa vào YOLO (ảnh nắn ~1320x940 px)")
     ap.add_argument("--pad", type=float, default=5, help="khoảng đệm quanh xe khi tìm chỗ trống (mm)")
-    ap.add_argument("--out", default=os.path.join(HERE, "ket_qua_tracking"))
+    ap.add_argument("--out", default=os.path.join(HERE, "tracking_result"))
     ap.add_argument("--do_yen", type=float, default=10,
                     help="xe đứng yên trong dải bao nhiêu giây thì coi là ĐÃ ĐỖ (lưu ID + vị trí)")
     ap.add_argument("--mat_xe", type=float, default=3,
@@ -756,11 +819,11 @@ def main():
 
     # Luồng YOLO giữ GIL của Python lâu; đổi luồng thường hơn để luồng hiển thị không bị chậm.
     sys.setswitchinterval(0.0005)
-    print(f"track_gate.py phien ban: {PHIEN_BAN}")
+    print(f"main.py phien ban: {PHIEN_BAN}")
     model, kw, gpu = load_model(a)
     print(f"YOLO: GPU {gpu} (FP16)")
     print(ipcam_full_hd(a.source, a.chat_luong))
-    reader = StreamReader(stream_urls(a.source, not a.mjpeg))
+    reader = StreamReader(stream_urls(a.source, a.h264))
     reader.start()
 
     frame, t0 = None, time.time()
@@ -780,7 +843,7 @@ def main():
     cv2.imwrite(os.path.join(a.out, "khung_dau.jpg"), frame)   # lưu khung đầu để kiểm tra góc máy
 
     # nhật ký sự kiện: mỗi lần chạy 1 file riêng
-    log_path = os.path.join(a.out, f"su_kien_{time.strftime('%Y%m%d_%H%M%S')}.csv")
+    log_path = os.path.join(a.out, f"{time.strftime('%Y%m%d_%H%M%S')}.csv")
     log = open(log_path, "w", newline="", encoding="utf-8-sig")
     logw = csv.writer(log)
     logw.writerow(["thoi_gian", "khung_hinh", "xe_id", "su_kien", "cong", "day", "x_mm", "y_mm", "ghi_chu"])
