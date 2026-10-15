@@ -4,7 +4,23 @@ Chạy:   uv run ./main.py                                   (URL ở STREAM_URL
         uv run ./main.py --source http://<ip>:8080/video   (nhập URL trực tiếp)
 Tùy chọn: --model weights/best.pt  --conf 0.5  --imgsz 640  --pad 5  --do_yen 10  --mat_xe 3  --mat_xe_do 8
           --h264 (thử RTSP H.264 trước rồi mới MJPEG)  --chat_luong 80
-Cấu trúc: main.py, helpers/ (detect_lot.py, find_spaces.py, measure_gaps.py), weights/best.pt. Cần torch bản CUDA.
+
+Cấu trúc thư mục:
+  main.py            đọc tham số, mở stream, chạy vòng lặp cửa sổ chính (file này)
+  core/config.py     hằng số dùng chung (Full HD, màu vẽ)
+  core/rate.py       đo FPS
+  core/camera.py     IP Webcam: đặt Full HD, StreamReader đọc khung mới nhất, danh sách URL thử
+  core/lot.py        tờ giấy -> mặt phẳng bãi (mm): paper_quad, LotLock, PRINT_MM, GATES_MM, in_row, gate_at
+  core/vision.py     YOLO: load_model (GPU FP16), rect_map (ảnh nắn thẳng), car_shape, car_like
+  core/tracker.py    Car, ParkingRegistry (cấp ID, sự kiện vao / do / roi_cho / roi_bai)
+  core/detector.py   Detector (xử lý 1 khung) và DetectWorker (thread chạy YOLO)
+  core/drawing.py    vẽ kết quả (xe, chỗ trống, dải đỗ) lên khung hình video
+  core/ui.py         giao diện 1920x1080 trên nền assets/ui_bg.png: ô video, hai cột thông số, khung log cuộn được
+  core/panels.py     nội dung hai cột thông số
+  core/event_log.py  ghi nhật ký sự kiện ra CSV + câu tiếng Việt cho khung log
+  assets/ui_bg.png   ảnh nền giao diện (Canva)
+  helpers/           thuật toán ảnh tĩnh giai đoạn 1-4 (detect_lot, measure_gaps, find_spaces)
+  weights/best.pt    model YOLOv8s-seg
 
 Stream: mặc định đọc MJPEG (/video, cùng luồng với web player của IP Webcam) vì đã đủ FPS và ổn định.
 --h264: thử RTSP H.264 trước (rtsp://<ip>:8080/h264_ulaw.sdp rồi h264.sdp), không được thì về MJPEG.
@@ -26,777 +42,35 @@ Các bước:
   3. Mỗi giây chạy lõi giai đoạn 4 (find_spaces, 4 px/mm) trên các xe đang đứng yên để vẽ chỗ trống.
 
 YOLO chạy ở thread riêng trên khung MỚI NHẤT; cửa sổ hiện mọi khung của stream kèm kết quả gần nhất.
-Phím tắt: q = thoát, space = tạm dừng.
-Kết quả: tracking_result/<ngày_giờ>.csv (nhật ký mỗi lần chạy, cạnh file track_gate.py).
+Phím tắt: q = thoát, space = tạm dừng, f = bật/tắt toàn màn hình. Con lăn chuột trên khung log để xem dòng cũ.
+Kết quả: tracking_result/<ngày_giờ>.csv (nhật ký mỗi lần chạy).
 """
 import argparse
-import base64
-import csv
-import json
 import os
 import sys
-import threading
 import time
-import traceback
-import urllib.request
-from collections import deque
-from urllib.parse import unquote, urlsplit, urlunsplit
 
 import cv2
-import numpy as np
 
 HERE = os.path.dirname(os.path.abspath(__file__))   # thư mục chứa main.py
-if HERE not in sys.path:   # để import helpers/ dù chạy main.py từ thư mục nào
+if HERE not in sys.path:   # để import core/ và helpers/ dù chạy main.py từ thư mục nào
     sys.path.insert(0, HERE)
 
-from helpers.detect_lot import ROWS_MM
-from helpers.find_spaces import S, find_spaces
+from core.camera import StreamReader, ipcam_full_hd, stream_urls
+from core.config import FULL_HD
+from core.detector import DetectWorker, Detector
+from core.drawing import draw_overlay
+from core.event_log import EventLog
+from core.panels import left_items, right_items
+from core.rate import Rate
+from core.ui import Dashboard
+from core.vision import load_model
 
-PHIEN_BAN = "2026-10-14 v5.6 (MJPEG mặc định + chống tay/bóng + ô trống vẽ dài theo khe)"   # in ra khi chạy để biết đang chạy bản nào
+PHIEN_BAN = "2026-10-15 v6.1 (lọc bóng tay/người theo hình mask trước khi cấp ID)"   # in ra khi chạy để biết đang chạy bản nào
 STREAM_URL = "http://192.168.1.9:8080/video"   # <-- URL IP Webcam (có thể dạng http://user:pass@ip:8080/video)
-FULL_HD = (1920, 1080)
-RED, GREEN, YELLOW, CYAN, MAGENTA, WHITE = (0, 0, 255), (0, 200, 0), (0, 220, 255), (255, 200, 0), (255, 0, 255), (255, 255, 255)
-BLUE = (255, 90, 0)
 
 
-class Rate:
-    """Đếm số sự kiện trong 2 giây gần nhất -> FPS thật (không bị thổi phồng khi khung đến dồn cục)."""
-
-    def __init__(self, window=2.0):
-        self.t, self.window = deque(), window
-
-    def tick(self):
-        now = time.time()
-        self.t.append(now)
-        while self.t and now - self.t[0] > self.window:
-            self.t.popleft()
-
-    def get(self):
-        if len(self.t) < 2:
-            return 0.0
-        return (len(self.t) - 1) / max(time.time() - self.t[0], 1e-3)
-
-
-# ------------------------------------------------------------------ IP Webcam
-def _request(url):
-    """urllib Request có Basic Auth nếu URL chứa user:pass@."""
-    p = urlsplit(url)
-    host = p.hostname + (f":{p.port}" if p.port else "")
-    req = urllib.request.Request(urlunsplit((p.scheme, host, p.path, p.query, "")))
-    if p.username:
-        cred = f"{unquote(p.username)}:{unquote(p.password or '')}"
-        req.add_header("Authorization", "Basic " + base64.b64encode(cred.encode()).decode())
-    return req
-
-
-def ipcam_full_hd(url, quality=80):
-    """Đặt IP Webcam về 1920x1080 và chất lượng JPEG cao qua HTTP API của app.
-    Trả về chuỗi mô tả để in ra màn hình (không dừng chương trình nếu lỗi)."""
-    base = url.split("/video")[0].rstrip("/")
-    try:
-        with urllib.request.urlopen(_request(base + "/status.json?show_avail=1"), timeout=8) as r:
-            st = json.loads(r.read().decode("utf-8", "ignore"))
-        cur = st.get("curvals", {})
-        avail = st.get("avail", {}).get("video_size", [])
-        want = f"{FULL_HD[0]}x{FULL_HD[1]}"
-        msg = [f"IP Webcam đang để: {cur.get('video_size')} , chất lượng {cur.get('quality')}%"]
-        if avail and want not in avail:
-            msg.append(f"Camera không có {want}. Các cỡ hỗ trợ: {', '.join(avail)}")
-        elif cur.get("video_size") != want:
-            urllib.request.urlopen(_request(f"{base}/settings/video_size?set={want}"), timeout=8).read()
-            msg.append(f"Đã chuyển sang {want}")
-        if str(cur.get("quality")) != str(quality):
-            urllib.request.urlopen(_request(f"{base}/settings/quality?set={quality}"), timeout=8).read()
-            msg.append(f"Đã đặt chất lượng JPEG {quality}%")
-        return " | ".join(msg)
-    except Exception as e:
-        return f"Không đọc/đặt được cấu hình IP Webcam ({e}). Hãy chỉnh tay trong app: Video resolution 1920x1080."
-
-
-class StreamReader(threading.Thread):
-    """Đọc stream ở thread riêng, luôn giữ khung hình MỚI NHẤT ở độ phân giải gốc (không thu nhỏ).
-    Thử lần lượt các URL (H.264 RTSP trước, rồi MJPEG); URL nào đọc được thì dùng."""
-
-    def __init__(self, urls):
-        super().__init__(daemon=True)
-        self.urls, self.frame, self.fid = urls, None, 0
-        self.lock, self.running, self.info = threading.Lock(), True, "Đang kết nối..."
-        self.rate = Rate()                     # FPS thật của stream điện thoại gửi về
-        self.using = None
-
-    def run(self):
-        while self.running:
-            urls = ([self.using] if self.using else []) + [u for u in self.urls if u != self.using]
-            for u in urls:                     # URL đã chạy được thì thử lại trước
-                name = u.split("@")[-1]
-                self.info = f"Đang thử {name}..."
-                print(self.info)
-                url, _, tr = u.partition(" (")
-                os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = (f"rtsp_transport;{tr.rstrip(')')}|fflags;nobuffer|flags;low_delay"
-                                                            if tr else "")
-                cap = cv2.VideoCapture(url, cv2.CAP_FFMPEG, [cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 5000,
-                                                           cv2.CAP_PROP_READ_TIMEOUT_MSEC, 5000])
-                if not cap.isOpened():
-                    print(f"  -> không mở được {name}")
-                    cap.release()
-                    continue
-                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-                got, fails = 0, 0
-                # chưa nhận khung nào thì bỏ URL sau 3 lần đọc lỗi; đang chạy thì cho phép rớt tới 30 lần
-                while self.running and fails < (30 if got else 3):
-                    ok, f = cap.read()
-                    if not ok:
-                        fails += 1
-                        time.sleep(0.05)
-                        continue
-                    fails, got = 0, got + 1
-                    if self.using != u:
-                        self.using = u
-                        print(f"Đang đọc stream: {name}")
-                    with self.lock:
-                        self.frame, self.fid = f, self.fid + 1
-                    self.rate.tick()
-                    self.info = "Stream OK"
-                cap.release()
-                if not got:
-                    print(f"  -> mở được {name} nhưng không nhận được khung hình")
-                if not self.running:
-                    return
-            self.info = "Mất kết nối stream, đang thử lại..."
-            time.sleep(1)
-
-    def get(self):
-        with self.lock:
-            return (None, 0) if self.frame is None else (self.frame, self.fid)
-
-
-def stream_urls(url, h264=False):
-    """Danh sách URL thử: RTSP H.264 + ulaw rồi H.264 qua TCP (chỉ khi --h264); sau đó MJPEG.
-    Đuôi " (tcp)" / " (udp)" là cách truyền RTSP, được tách ra trước khi mở."""
-    p = urlsplit(url)
-    base = url.split("/video")[0].rstrip("/")
-    urls = []
-    if h264 and p.scheme == "http":
-        rtsp = urlunsplit(("rtsp", p.netloc, "/h264.sdp", "", ""))
-        # IP Webcam: link có audio (h264_ulaw) mới ra hình ổn định; link h264.sdp chỉ có video hay treo
-        ulaw = urlunsplit(("rtsp", p.netloc, "/h264_ulaw.sdp", "", ""))
-        urls += [ulaw + " (tcp)", rtsp + " (tcp)"]
-    urls += [url, base + "/video", base + "/videofeed"]
-    return list(dict.fromkeys(urls))
-
-
-# ------------------------------------------------------------------ tờ giấy -> mặt phẳng bãi
-# Vùng in tối của tờ A3 và 2 ô cam, theo mm trên mặt phẳng bãi (gốc = góc trên-trái khung bãi,
-# giống ROWS_MM). Đo trung bình trên 4 ảnh TEST đã nắn bằng 2 dải đỗ, lệch giữa các ảnh < 1.5 mm.
-PRINT_MM = np.float32([[-31.6, -60.1], [390.2, -59.3], [391.6, 238.3], [-32.4, 237.8]])   # TL, TR, BR, BL
-GATES_MM = {"cong trai": (-19.3, 187.8, 62.3, 228.2),           # x0, y0, x1, y1 của ô cam
-            "cong phai": (299.9, -48.9, 380.9, -8.3)}
-
-
-def _order(p):
-    p = p.reshape(-1, 2).astype(np.float32)
-    s, d = p.sum(1), np.diff(p, axis=1).ravel()
-    return np.float32([p[s.argmin()], p[d.argmin()], p[s.argmax()], p[d.argmax()]])
-
-
-def _paper_quad_at(sm, vmin):
-    hsv = cv2.cvtColor(sm, cv2.COLOR_BGR2HSV)
-    white = ((hsv[..., 2] >= vmin) & (hsv[..., 1] < 50)).astype(np.uint8) * 255   # lề giấy trắng
-    white = cv2.morphologyEx(white, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
-    cnts, hier = cv2.findContours(white, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
-    if hier is None:
-        return None
-    H, W = white.shape
-    best = None
-    for c, h in zip(cnts, hier[0]):
-        if h[3] < 0:                       # chỉ lấy "lỗ" bên trong lề trắng = vùng in tối
-            continue
-        area = cv2.contourArea(c)
-        if area < 0.08 * H * W:
-            continue
-        hull = cv2.convexHull(c)
-        for eps in (0.01, 0.02, 0.03, 0.05):
-            q = cv2.approxPolyDP(hull, eps * cv2.arcLength(hull, True), True)
-            if len(q) == 4:
-                break
-        if len(q) != 4 or area / cv2.contourArea(q) < 0.9:
-            continue
-        q = _order(q)
-        w = (np.linalg.norm(q[1] - q[0]) + np.linalg.norm(q[2] - q[3])) / 2
-        h_ = (np.linalg.norm(q[3] - q[0]) + np.linalg.norm(q[2] - q[1])) / 2
-        if not 1.15 < max(w, h_) / min(w, h_) < 1.75:      # A3 = 1.41, cho phép méo phối cảnh
-            continue
-        if best is None or area > best[0]:
-            best = (area, q)
-    return None if best is None else best[1]
-
-
-def paper_quad(frame, work_w=1280):
-    """4 góc vùng in tối của tờ giấy (TL, TR, BR, BL theo hướng cạnh dài nằm ngang), hoặc None.
-    Lề giấy trắng tạo thành một vòng sáng khép kín; lỗ bên trong vòng đó chính là vùng in."""
-    f = work_w / frame.shape[1]
-    sm = cv2.resize(frame, None, fx=f, fy=f, interpolation=cv2.INTER_AREA)
-    for vmin in (235, 215, 195, 175, 155):                   # thử dần ngưỡng sáng theo ánh sáng phòng
-        q = _paper_quad_at(sm, vmin)
-        if q is not None:
-            q = q / f
-            if np.linalg.norm(q[1] - q[0]) < np.linalg.norm(q[3] - q[0]):
-                q = np.roll(q, 1, axis=0)                     # giấy đặt dọc -> xoay để cạnh dài là trục x
-            return q
-    return None
-
-
-class LotLock:
-    """Khoá khung bãi theo 4 góc tờ giấy. Trạng thái:
-      "tim"  : chưa có khung, thử paper_quad mỗi 1 s
-      "khoa" : đã khoá, mỗi khung chỉ kiểm tra dải viền quanh tờ giấy (ảnh nhỏ 320 px, rất nhẹ)
-      "cho"  : viền bị thay đổi -> chờ ảnh đứng yên `settle_s` giây rồi tìm lại 4 góc
-    update() trả về "moi" khi khung bãi mới khác khung cũ, ngược lại None."""
-
-    SW = 320                                   # chiều rộng ảnh nhỏ dùng để so chuyển động
-
-    def __init__(self, settle_s=1.0, still_diff=3.0, band=0.025, side_frac=0.5):
-        self.q = self.H = None
-        self.state = "tim"
-        self.settle_s, self.still_diff, self.band, self.side_frac = settle_s, still_diff, band, side_frac
-        self.prev = self.ref = self.sides = None
-        self.t_still = self.t_try = 0.0
-
-    def _small(self, frame):
-        f = self.SW / frame.shape[1]
-        g = cv2.cvtColor(cv2.resize(frame, None, fx=f, fy=f, interpolation=cv2.INTER_AREA), cv2.COLOR_BGR2GRAY)
-        return cv2.GaussianBlur(g, (5, 5), 0), f
-
-    def _make_sides(self, shape, qs):
-        """4 mặt nạ dải hẹp dọc theo 4 cạnh vùng in (gồm mép vùng in và mép tờ giấy), trên ảnh nhỏ."""
-        c = qs.mean(0)
-        outer = c + (qs - c) * (1 + self.band)
-        inner = c + (qs - c) * (1 - self.band)
-        ring = np.zeros(shape, np.uint8)
-        cv2.fillPoly(ring, [outer.astype(np.int32)], 255)
-        cv2.fillPoly(ring, [inner.astype(np.int32)], 0)
-        sides = []
-        for i in range(4):                     # tam giác tâm - 2 góc kề nhau cắt ra 1 cạnh
-            tri = np.zeros(shape, np.uint8)
-            a, b = c + (qs[i] - c) * 3, c + (qs[(i + 1) % 4] - c) * 3
-            cv2.fillPoly(tri, [np.int32([c, a, b])], 255)
-            sides.append((ring > 0) & (tri > 0))
-        return sides
-
-    def _lock(self, frame, q):
-        new = self.q is None or np.abs(q - self.q).mean() > 5
-        if new:
-            self.q = q
-            self.H = cv2.getPerspectiveTransform(q, PRINT_MM * S)          # khung hình -> bãi (S px/mm)
-        g, f = self._small(frame)
-        e = cv2.Canny(g, 40, 120) > 0
-        # mỗi cạnh: các điểm biên (mép giấy, mép vùng in) lúc khoá
-        self.sides = [np.nonzero(e & m) for m in self._make_sides(g.shape, self.q * f)]
-        self.sides = [ix for ix in self.sides if len(ix[0]) > 15]
-        self.ref = g
-        self.state = "khoa"
-        return "moi" if new else None
-
-    def _try_find(self, frame):
-        self.t_try = time.time()
-        q = paper_quad(frame)
-        if q is None or not cv2.isContourConvex(q.astype(np.int32)):
-            return None
-        x, y, w, h = cv2.boundingRect(q.astype(np.int32))
-        if w < 0.2 * frame.shape[1] or h < 0.2 * frame.shape[0]:          # quá nhỏ -> bỏ
-            return None
-        return self._lock(frame, q)
-
-    def update(self, frame):
-        g, _ = self._small(frame)
-        still = self.prev is not None and g.shape == self.prev.shape and \
-            cv2.absdiff(g, self.prev).mean() < self.still_diff
-        self.prev = g
-        now = time.time()
-        if self.state == "khoa":
-            if g.shape != self.ref.shape:
-                changed = 4
-            else:                              # tỉ lệ điểm biên lúc khoá không còn biên quanh nó
-                e = cv2.dilate(cv2.Canny(g, 40, 120), np.ones((3, 3), np.uint8)) > 0
-                changed = sum(1 - e[ix].mean() > self.side_frac for ix in self.sides)
-            if changed >= 2:                   # >= 2 cạnh lệch: giấy/máy xê dịch (tay chỉ che 1 cạnh)
-                self.state, self.t_still = "cho", now
-            return None
-        if not still:
-            self.t_still = now
-            return None
-        if self.state == "cho" and now - self.t_still < self.settle_s:
-            return None
-        if now - self.t_try < 1.0:
-            return None
-        ev = self._try_find(frame)
-        if self.state != "khoa":
-            self.state = "tim"
-        return ev
-
-
-def to_img(pts_lot_px, H):
-    return cv2.perspectiveTransform(np.float32(pts_lot_px).reshape(-1, 1, 2), np.linalg.inv(H)).reshape(-1, 2)
-
-
-# ------------------------------------------------------------------ YOLO
-REC_PX_MM = 3.0                 # độ phân giải ảnh "nắn thẳng" đưa vào YOLO (px/mm), ~1320x940 px
-REC_MARGIN_MM = 8.0             # lấy rộng ra ngoài vùng in một chút
-
-
-def rect_map(H):
-    """Homography khung hình -> ảnh nắn thẳng (tờ giấy nằm ngang, mọi xe trong dải đỗ đứng dọc như
-    lúc chụp dataset) và kích thước ảnh nắn. Gốc ảnh nắn = góc trên-trái vùng in trừ lề."""
-    lo = PRINT_MM.min(0) - REC_MARGIN_MM
-    hi = PRINT_MM.max(0) + REC_MARGIN_MM
-    A = np.array([[REC_PX_MM / S, 0, -lo[0] * REC_PX_MM],
-                  [0, REC_PX_MM / S, -lo[1] * REC_PX_MM], [0, 0, 1]])
-    Hr = A @ H
-    return Hr, np.linalg.inv(Hr), tuple(int(v) for v in np.ceil((hi - lo) * REC_PX_MM)), lo
-
-def car_shape(seg, box):
-    """Hình xe trên ảnh nắn: (viền mask để vẽ, 4 góc box xoay để tính tâm và chỗ trống).
-    Box xoay = minAreaRect của mask; khi mask hỏng (không có, quá méo, hoặc lem đầy box thẳng như lúc
-    2 xe đỗ sát nhau) thì dùng box thẳng, vốn đã song song với dải đỗ trên ảnh nắn."""
-    x1, y1, x2, y2 = box
-    quad = np.float32([[x1, y1], [x2, y1], [x2, y2], [x1, y2]])
-    if seg is None or len(seg) < 5:
-        return quad, quad
-    hull = cv2.convexHull(np.float32(seg)).reshape(-1, 2)
-    rc = cv2.minAreaRect(hull)
-    rw, rh = rc[1]
-    asp = max(rw, rh) / max(1e-3, min(rw, rh))
-    fill = rw * rh / max(1.0, (x2 - x1) * (y2 - y1))
-    straight = abs(((rc[2] % 90) + 45) % 90 - 45) < 5
-    if not 1.6 <= asp <= 3.2 or (fill > 0.9 and straight):
-        return hull, quad
-    return hull, np.float32(cv2.boxPoints(rc))
-
-
-CAR_SHORT_MM = (18.0, 75.0)     # cạnh ngắn hợp lệ của box xe (mm); xe thật ~28-37, box thẳng khi xe xoay 45° ~70
-CAR_LONG_MM = (45.0, 115.0)     # cạnh dài hợp lệ (mm); xe thật ~68
-
-
-def car_like(q):
-    """Loại phát hiện không giống xe: mảnh tay/bóng mảnh dài, khối tay + xe dính nhau quá to,
-    hoặc tâm nằm ngoài tờ giấy (tay thò vào từ mép)."""
-    a, b = np.hypot(*(q[1] - q[0])), np.hypot(*(q[2] - q[1]))
-    short, long_ = min(a, b), max(a, b)
-    c = q.mean(0)
-    lo, hi = PRINT_MM.min(0), PRINT_MM.max(0)
-    return (CAR_SHORT_MM[0] <= short <= CAR_SHORT_MM[1] and CAR_LONG_MM[0] <= long_ <= CAR_LONG_MM[1]
-            and lo[0] <= c[0] <= hi[0] and lo[1] <= c[1] <= hi[1])
-
-
-def load_model(a):
-    """YOLO trên GPU NVIDIA (torch CUDA), FP16. Không có CUDA thì dừng và in cách cài."""
-    import torch
-    from ultralytics import YOLO
-    if not torch.cuda.is_available():
-        sys.exit(f"Không thấy GPU CUDA (torch {torch.__version__}). Cài torch bản CUDA:\n"
-                 "  uv pip install --reinstall torch torchvision --index-url https://download.pytorch.org/whl/cu128")
-    model = YOLO(a.model)
-    return model, dict(imgsz=a.imgsz, device=0, quantize=16), torch.cuda.get_device_name(0)
-
-
-class Car:
-    """Một xe trong bãi với ID cố định do chương trình cấp.
-    Toạ độ đều theo mm trên mặt phẳng bãi nên không đổi khi tờ giấy/camera xê dịch rồi khoá lại."""
-
-    def __init__(self, cid, det, now, origin):
-        self.id, self.origin = cid, origin                 # origin: "co_san" | "cong trai" | "cong phai" | "xuat_hien"
-        self.state = "di_chuyen"                           # "di_chuyen" | "da_do"
-        self.quad = self.hull = self.c = None
-        self.hist = deque()                                # (t, tâm mm) để xét đứng yên
-        self.trail = deque(maxlen=60)
-        self.t_seen = self.t_start = now
-        self.t_park = None
-        self.update(det, now)
-
-    def update(self, det, now):
-        self.quad, self.hull, self.c = det["quad"], det["hull"], det["c"]
-        self.t_seen = now
-        self.hist.append((now, self.c))
-        self.trail.append(self.c)
-
-    def still_for(self, now, still_mm):
-        """Bao lâu (s) tâm xe không lệch quá still_mm so với vị trí hiện tại."""
-        t0 = now
-        for t, c in reversed(self.hist):
-            if np.hypot(*(c - self.c)) > still_mm:
-                break
-            t0 = t
-        return now - t0
-
-
-def in_row(c):
-    return next((k for k, (x0, y0, x1, y1) in enumerate(ROWS_MM) if x0 <= c[0] <= x1 and y0 <= c[1] <= y1), None)
-
-
-def gate_at(c, margin=15.0):
-    for name, (x0, y0, x1, y1) in GATES_MM.items():
-        if x0 - margin <= c[0] <= x1 + margin and y0 - margin <= c[1] <= y1 + margin:
-            return name
-    return None
-
-
-class ParkingRegistry:
-    """Theo dõi xe theo trạng thái (ý tưởng TTL):
-      - Xe mới xuất hiện ở ô cam -> sự kiện "vao" (ghi cổng). Xe có sẵn lúc bắt đầu -> "co_san".
-      - Xe đứng yên trong dải đỗ >= park_s giây -> "da_do": lưu ID + vị trí đỗ, KHÔNG cập nhật hình xe nữa
-        (đứng im, không giật). Tay che xe đang đỗ không làm mất ID.
-      - Xe đang đỗ bị nhấc/đẩy đi (phát hiện lệch khỏi chỗ đỗ, hoặc biến mất rồi hiện lại gần đó)
-        -> "roi_cho", theo dõi lại liên tục với ĐÚNG ID cũ.
-      - Xe đang di chuyển biến mất quá lost_s giây (hoặc xe đang đỗ biến mất quá lost_park_s)
-        -> "roi_bai": xoá khỏi danh sách đỗ, ghi lại ID đã rời bãi (kèm cổng nếu rời ở ô cam).
-    Ghép xe giữa các khung theo khoảng cách tâm (mm), cho phép xe nhảy xa khi bị tay che / FPS thấp,
-    nên cầm xe di chuyển không bị đổi ID."""
-
-    TIGHT_MM = 8.0          # lệch <= mức này coi là cùng chỗ (nhiễu mask)
-    HOLD_MM = 15.0          # xe đang đỗ: phát hiện lệch <= mức này vẫn là xe đó đứng yên (tay/bóng làm mask lệch)
-    STILL_MM = 5.0          # đứng yên nếu tâm không lệch quá mức này
-    MOVE_GATE_MM = 70.0     # xe đang chạy: ghép với phát hiện trong bán kính này (theo khung liền kề)
-    PARK_PICK_MM = 45.0     # xe đang đỗ: phát hiện lệch 15..45 mm quanh chỗ đỗ = xe đang bị dời đi
-    DUP_MM = 25.0           # phát hiện thừa có tâm gần xe đã có hơn mức này = mảnh tay/bóng dính vào xe, bỏ
-    CAND_MM = 40.0          # ứng viên xe mới: ghép giữa các khung trong bán kính này
-    CAND_HITS = 3           # ứng viên phải được thấy ở >= ngần này khung YOLO ...
-    CAND_S = 0.3            # ... tồn tại >= ngần này giây ...
-    CAND_RATIO = 0.7        # ... và có mặt ở >= 70% số khung kể từ lúc xuất hiện thì mới cấp ID (tay chập chờn thì không)
-    CAND_TTL = 0.6          # ứng viên không thấy lại quá ngần này giây thì bỏ
-
-    def __init__(self, park_s, lost_s, lost_park_s, startup_s, log_event):
-        self.park_s, self.lost_s, self.lost_park_s, self.startup_s = park_s, lost_s, lost_park_s, startup_s
-        self.cars, self.next_id, self.t0 = {}, 1, None
-        self.cands = []                            # ứng viên xe mới chưa cấp ID: {c, det, hits, t0, t}
-        self.log = log_event                       # log(xe, su_kien, cong, ghi_chu)
-        self.n_in = self.n_out = 0
-
-    def _new(self, det, now, t_first=None):
-        if self.t0 is None:
-            self.t0 = now
-        g = gate_at(det["c"])
-        t_first = now if t_first is None else t_first
-        origin = "co_san" if t_first - self.t0 < self.startup_s and g is None else (g or "xuat_hien")
-        car = Car(self.next_id, det, now, origin)
-        self.cars[car.id] = car
-        self.next_id += 1
-        if origin == "co_san":
-            self.log(car, "co_san", "", "xe có sẵn khi bắt đầu chạy")
-        elif g:
-            self.n_in += 1
-            self.log(car, "vao", g, "xe mới vào bãi")
-        else:
-            self.log(car, "xuat_hien", "", "xe mới không đi qua ô cam (có thể bị mất dấu quá lâu)")
-        return car
-
-    def _start_moving(self, car, det, now, why):
-        car.state, car.t_park = "di_chuyen", None
-        car.hist.clear()
-        car.update(det, now)
-        self.log(car, "roi_cho", "", why)
-
-    def step(self, dets, now):
-        if self.t0 is None:
-            self.t0 = now
-        free = list(range(len(dets)))
-        cars = list(self.cars.values())
-
-        def take(pairs, limit):
-            """Ghép tham lam theo khoảng cách tăng dần; trả về các cặp (car, det) đã ghép."""
-            pairs = sorted((d, c.id, j) for c, j, d in pairs if d <= limit)
-            used_c, out = set(), []
-            for d, cid, j in pairs:
-                if cid in used_c or j not in free:
-                    continue
-                used_c.add(cid)
-                free.remove(j)
-                out.append((self.cars[cid], j))
-            return out
-
-        dist = lambda c, j: float(np.hypot(*(dets[j]["c"] - c.c)))
-        matched = set()
-        # 0) xe đang đỗ: phát hiện lệch ít (tay che / bóng đổ làm mask xê dịch) -> vẫn đứng yên, giữ box đã lưu.
-        #    Làm TRƯỚC để xe khác (hay "xe ma" do tay) không giành mất phát hiện của xe đang đỗ.
-        parked = [c for c in cars if c.state == "da_do"]
-        for car, j in take([(c, j, dist(c, j)) for c in parked for j in free], self.HOLD_MM):
-            matched.add(car.id)
-            car.t_seen = now
-        # 1) xe đang chạy có phát hiện gần như trùng chỗ
-        moving = [c for c in cars if c.id not in matched and c.state == "di_chuyen"]
-        for car, j in take([(c, j, dist(c, j)) for c in moving for j in free], self.TIGHT_MM):
-            matched.add(car.id)
-            car.update(dets[j], now)
-        # 2) xe đang chạy (vừa thấy < 1 s) trong bán kính MOVE_GATE_MM và xe đang đỗ bị lệch HOLD..PARK_PICK mm
-        #    ghép CHUNG theo khoảng cách: phát hiện thuộc về xe gần nhất, không ưu tiên xe đang chạy nữa
-        pairs = [(c, j, dist(c, j)) for c in cars if c.id not in matched for j in free
-                 if (c.state == "di_chuyen" and now - c.t_seen < 1.0 and dist(c, j) <= self.MOVE_GATE_MM)
-                 or (c.state == "da_do" and dist(c, j) <= self.PARK_PICK_MM)]
-        for car, j in take(pairs, self.MOVE_GATE_MM):
-            matched.add(car.id)
-            if car.state == "da_do":
-                self._start_moving(car, dets[j], now, "xe đang đỗ bị dời khỏi chỗ")
-            else:
-                car.update(dets[j], now)
-        # 3) phát hiện còn thừa: nhận lại xe vừa mất dấu gần đó (bán kính tăng theo thời gian mất dấu)
-        lost = [c for c in cars if c.id not in matched]
-        pairs = []
-        for c in lost:
-            r = min(250.0, 60.0 + 150.0 * (now - c.t_seen))
-            pairs += [(c, j, dist(c, j)) for j in free if dist(c, j) <= r]
-        for car, j in take(pairs, 250.0):
-            matched.add(car.id)
-            if car.state == "da_do":
-                self._start_moving(car, dets[j], now, "xe đang đỗ được nhấc lên đặt chỗ khác")
-            else:
-                car.update(dets[j], now)
-        # 4) phát hiện không thuộc xe nào: bỏ mảnh dính sát xe đã có (2 xe thật không thể cách tâm < DUP_MM),
-        #    phần còn lại thành ứng viên; chỉ cấp ID khi ứng viên được thấy đủ CAND_HITS khung / CAND_S giây
-        rest = [j for j in free if all(dist(c, j) > self.DUP_MM for c in self.cars.values())]
-        used = set()
-        for j in rest:
-            c_j = dets[j]["c"]
-            best = min((k for k in range(len(self.cands)) if k not in used),
-                       key=lambda k: np.hypot(*(self.cands[k]["c"] - c_j)), default=None)
-            if best is not None and np.hypot(*(self.cands[best]["c"] - c_j)) <= self.CAND_MM:
-                cd = self.cands[best]
-                cd.update(c=c_j, det=dets[j], t=now, hits=cd["hits"] + 1)
-            else:
-                self.cands.append({"c": c_j, "det": dets[j], "hits": 1, "n": 0, "t0": now, "t": now})
-                best = len(self.cands) - 1
-            used.add(best)
-        keep = []
-        for cd in self.cands:
-            cd["n"] += 1                                    # số khung YOLO kể từ lúc ứng viên xuất hiện
-            ratio = cd["hits"] / cd["n"]
-            if cd["t"] == now and cd["hits"] >= self.CAND_HITS and now - cd["t0"] >= self.CAND_S \
-                    and ratio >= self.CAND_RATIO:
-                self._new(cd["det"], now, cd["t0"])
-            elif now - cd["t"] <= self.CAND_TTL and (cd["n"] < 5 or ratio >= 0.5):
-                keep.append(cd)
-        self.cands = keep
-        # 5) chuyển trạng thái
-        for car in list(self.cars.values()):
-            gone = now - car.t_seen
-            if car.state == "di_chuyen":
-                while car.hist and now - car.hist[0][0] > self.park_s + 2:
-                    car.hist.popleft()
-                if car.id in matched and in_row(car.c) is not None and \
-                        car.still_for(now, self.STILL_MM) >= self.park_s:
-                    car.state, car.t_park = "da_do", now
-                    self.log(car, "do", "", f"đứng yên {self.park_s:.0f} s trong dãy {'trên' if in_row(car.c) == 0 else 'dưới'}")
-                # xe chỉ rời bãi qua ô cam: mất dấu giữa bãi (tay cầm che) thì chờ lâu như xe đang đỗ
-                elif gone > (self.lost_s if gate_at(car.c, margin=25.0) else self.lost_park_s):
-                    self._leave(car, now)
-            elif gone > self.lost_park_s:
-                self._leave(car, now)
-
-    def _leave(self, car, now):
-        g = gate_at(car.c, margin=25.0)
-        self.n_out += 1
-        self.log(car, "roi_bai", g or "", "mất dấu khi đang đỗ" if car.state == "da_do" else "xe rời khỏi bãi")
-        del self.cars[car.id]
-
-    def shift(self, dt):
-        """Dời mốc thời gian của mọi xe đi dt giây (sau khi tạm dừng detect)."""
-        for cd in self.cands:
-            cd["t0"] += dt
-            cd["t"] += dt
-        for car in self.cars.values():
-            car.t_seen += dt
-            car.hist = deque((t + dt, c) for t, c in car.hist)
-        if self.t0 is not None:
-            self.t0 += dt
-
-    def still_now(self, car, now, s=1.0):
-        return car.state == "da_do" or car.still_for(now, self.STILL_MM) >= s
-
-
-class Detector:
-    """Toàn bộ phần xử lý của 1 khung hình: khoá tờ giấy, YOLO trên ảnh nắn, ParkingRegistry, find_spaces.
-    step() trả về một "ảnh chụp" kết quả (dict) để vẽ; không sửa khung hình đưa vào."""
-
-    SPACE_S = 4                                # px/mm khi chạy find_spaces trên video
-
-    def __init__(self, model, track_kw, a, log_event):
-        self.model, self.kw, self.a = model, track_kw, a
-        self.paper = LotLock()
-        self.reg = ParkingRegistry(a.do_yen, a.mat_xe, a.mat_xe_do, 3.0, log_event)
-        self.spaces, self.t_space, self.n = [], 0.0, 0
-        self.det_rate = Rate()
-        self._rmap = None
-        self.t_hold = None                     # lúc bắt đầu tạm dừng detect (giấy/máy xê dịch)
-        self.snap = None
-
-    def _detect(self, frame, H):
-        """YOLO trên ảnh nắn thẳng -> list xe {quad, hull, c} theo mm trên mặt phẳng bãi."""
-        if self._rmap is None or self._rmap[0] is not H:
-            self._rmap = (H,) + rect_map(H)
-        _, Hr, _, size, lo = self._rmap
-        rect = cv2.warpPerspective(frame, Hr, size, flags=cv2.INTER_LINEAR)
-        r = self.model.predict(rect, conf=self.a.conf, verbose=False, **self.kw)[0]
-        dets = []
-        if r.boxes is not None and len(r.boxes):
-            segs = r.masks.xy if r.masks is not None else []
-            for i, box in enumerate(r.boxes.xyxy.cpu().numpy()):
-                hull, quad = car_shape(segs[i] if i < len(segs) else None, box)
-                q = quad / REC_PX_MM + lo
-                if not car_like(q):
-                    continue
-                dets.append({"quad": q, "hull": hull / REC_PX_MM + lo, "c": q.mean(0)})
-        return dets
-
-    def step(self, frame):
-        self.n += 1
-        paper, now = self.paper, time.time()
-        prev_state = paper.state
-        if paper.update(frame) == "moi" and self.n > 1:
-            # toạ độ xe lưu theo mm trên mặt phẳng bãi nên vẫn đúng sau khi khoá lại, không cần xoá
-            self.spaces, self.t_space = [], 0.0
-            print("Da ve lai khung bai theo vi tri moi cua to giay")
-        if prev_state == "khoa" and paper.state == "cho":
-            print("Giay/may xe dich -> tam dung detect, cho on dinh...")
-        H = paper.H if paper.state == "khoa" else None
-        if H is None:
-            if self.t_hold is None:
-                self.t_hold = now
-        else:
-            if self.t_hold is not None:        # bỏ qua thời gian tạm dừng để xe không bị coi là mất dấu
-                self.reg.shift(now - self.t_hold)
-                self.t_hold = None
-            self.reg.step(self._detect(frame, H), now)
-            # lõi giai đoạn 4 mỗi giây, chỉ tính các xe đang đứng yên (xe đang cầm trên tay không chặn chỗ)
-            if time.time() - self.t_space > 1.0:
-                quads = [to_img(c.quad * S, H) for c in self.reg.cars.values() if self.reg.still_now(c, now)]
-                s = self.SPACE_S
-                res = find_spaces(quads, H, self.a.pad, s=s)
-                self.spaces = [{"slot_mm": np.float32(sp["gap_px"]) / s, "gap_mm": sp["gap_mm"],
-                                "capacity": sp["capacity"]} for sp in res["spaces"]]
-                self.t_space = time.time()
-        self.det_rate.tick()
-        self.snap = {
-            "cars": [{"id": c.id, "state": c.state, "origin": c.origin, "hull": c.hull,
-                      "trail": list(c.trail) if c.state == "di_chuyen" else [],
-                      "seen": now - c.t_seen < 0.5} for c in self.reg.cars.values()],
-            "spaces": self.spaces, "state": paper.state,
-            "q": None if paper.q is None else paper.q.copy(), "H": H,
-            "n_in": self.reg.n_in, "n_out": self.reg.n_out, "det_fps": self.det_rate.get(),
-        }
-        return self.snap
-
-
-class DetectWorker(threading.Thread):
-    """Chạy Detector.step liên tục trên khung MỚI NHẤT của stream; lỗi được in ra rồi chạy tiếp."""
-
-    def __init__(self, det, reader):
-        super().__init__(daemon=True)
-        self.det, self.reader = det, reader
-        self.running, self.paused, self.errors = True, False, 0
-
-    def run(self):
-        last = 0
-        while self.running:
-            f, fid = self.reader.get()
-            if self.paused or f is None or fid == last:
-                time.sleep(0.003)
-                continue
-            last = fid
-            try:
-                self.det.step(f)
-            except Exception:
-                self.errors += 1
-                print(f"Loi khi detect (lan {self.errors}), bo qua khung nay:")
-                traceback.print_exc()
-                time.sleep(0.2)
-
-
-# ------------------------------------------------------------------ vẽ
-_static_cache = {}
-
-
-def _static_overlay(H):
-    """Hàm đổi mm -> pixel khung hình và các khung cố định (dải đỗ, ô cam): chỉ tính lại khi khung bãi đổi."""
-    key = id(H)
-    if key not in _static_cache:
-        _static_cache.clear()
-        Hinv = np.linalg.inv(H)
-
-        def img(pts_mm):
-            return cv2.perspectiveTransform(np.float32(pts_mm).reshape(-1, 1, 2) * S, Hinv).reshape(-1, 2)
-
-        rect = lambda x0, y0, x1, y1: img([[x0, y0], [x1, y0], [x1, y1], [x0, y1]]).astype(np.int32)
-        rows = [rect(*r) for r in ROWS_MM]
-        gates = [(rect(*r), name) for name, r in GATES_MM.items()]
-        _static_cache[key] = (img, rows, gates)
-    return _static_cache[key]
-
-
-def label_inside(out, poly, lines, outline, lw, dim=0.55):
-    """Viền poly bằng màu outline, làm tối nhẹ bên trong rồi ghi các dòng chữ ở giữa hình."""
-    poly = np.int32(poly).reshape(-1, 2)
-    Hh, Ww = out.shape[:2]
-    x, y, w, h = cv2.boundingRect(poly)
-    x0, y0, x1, y1 = max(0, x), max(0, y), min(Ww, x + w), min(Hh, y + h)
-    if x1 > x0 and y1 > y0:
-        roi = out[y0:y1, x0:x1]
-        m = np.zeros(roi.shape[:2], np.uint8)
-        cv2.fillPoly(m, [poly - (x0, y0)], 1)
-        sel = m.astype(bool)
-        roi[sel] = (roi[sel] * dim).astype(np.uint8)
-    cv2.polylines(out, [poly.reshape(-1, 1, 2)], True, outline, lw)
-    if not lines:
-        return
-    fs, th = lw / 4.5, max(1, lw - 1)
-    sizes = [cv2.getTextSize(t, cv2.FONT_HERSHEY_SIMPLEX, fs, th)[0] for t in lines]
-    lh = max(s[1] for s in sizes) + 8
-    cx, cy = poly.mean(0)
-    ty = cy - lh * len(lines) / 2 + lh - 4
-    for t, (tw, _) in zip(lines, sizes):
-        cv2.putText(out, t, (int(cx - tw / 2), int(ty)), cv2.FONT_HERSHEY_SIMPLEX, fs, WHITE, th, cv2.LINE_AA)
-        ty += lh
-
-
-def draw_overlay(out, snap, info, lw):
-    """Vẽ kết quả detect gần nhất (snap) lên khung hình out (sửa trực tiếp out)."""
-    H = snap["H"] if snap else None
-    spaces = snap["spaces"] if snap and H is not None else []
-    if H is not None:
-        img, rows, gates = _static_overlay(H)
-        cv2.polylines(out, [snap["q"].astype(np.int32)], True, WHITE, lw)
-        cv2.polylines(out, rows, True, YELLOW, lw)
-        busy = {gate_at(c["hull"].mean(0), margin=0) for c in snap["cars"]}
-        for g, name in gates:                    # tên ô cam chỉ ghi khi không có xe trong ô
-            label_inside(out, g, [] if name in busy else [name], MAGENTA, lw, dim=0.8)
-        for k, sp in enumerate(spaces, 1):       # ô xanh phủ hết đoạn trống: số thứ tự, độ dài khe, số xe đặt được
-            x1, y1, x2, y2 = sp["slot_mm"]
-            n = sp["capacity"]
-            car_s = f"{n} car" + ("s" if n > 1 else "")    # cv2.putText không viết được dấu tiếng Việt
-            text = [f"#{k}  {sp['gap_mm']:.0f}mm", f"fits {car_s}"] if sp["gap_mm"] >= 90 else \
-                [f"#{k}", f"{sp['gap_mm']:.0f}mm", car_s]
-            label_inside(out, img([[x1, y1], [x2, y1], [x2, y2], [x1, y2]]), text, GREEN, lw)
-        for car in snap["cars"]:
-            parked = car["state"] == "da_do"
-            new = car["origin"].startswith("cong")
-            col = BLUE if parked else (CYAN if new else RED)
-            text = [f"ID {car['id']}", "DO" if parked else ("MOI" if new else "")]
-            if new and not parked:
-                text.append(car["origin"])
-            if not car["seen"]:
-                text.append("bi che")
-            if len(car["trail"]) > 1:
-                cv2.polylines(out, [img(car["trail"]).astype(np.int32).reshape(-1, 1, 2)], False, col, max(1, lw - 1))
-            label_inside(out, img(car["hull"]), [t for t in text if t], col, lw)
-    n_do = sum(c["state"] == "da_do" for c in snap["cars"]) if snap else 0
-    n_mv = len(snap["cars"]) - n_do if snap else 0
-    text = info + [f"Dang do: {n_do} | dang di chuyen: {n_mv} | da vao: {snap['n_in'] if snap else 0}"
-                   f" | da roi: {snap['n_out'] if snap else 0} | cho trong: {len(spaces)}"]
-    for i, t in enumerate(text):
-        cv2.putText(out, t, (20, 40 + i * 38), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 0), 6)
-        cv2.putText(out, t, (20, 40 + i * 38), cv2.FONT_HERSHEY_SIMPLEX, 1.0, WHITE, 2)
-    return out
-
-
-# ------------------------------------------------------------------ main
-def main():
+def parse_args():
     ap = argparse.ArgumentParser()
     ap.add_argument("--source", default=STREAM_URL, help="URL IP Webcam, vd http://<ip>:8080/video")
     ap.add_argument("--h264", action="store_true", help="thử RTSP H.264 trước, không được mới đọc MJPEG /video (mặc định: chỉ MJPEG)")
@@ -816,7 +90,23 @@ def main():
     if not os.path.isabs(a.model) and not os.path.exists(a.model):
         a.model = os.path.join(HERE, a.model)
     os.makedirs(a.out, exist_ok=True)
+    return a
 
+
+def wait_first_frame(reader, timeout=60):
+    t0 = time.time()
+    while True:
+        frame, _ = reader.get()
+        if frame is not None:
+            return frame
+        if time.time() - t0 > timeout:
+            reader.running = False
+            sys.exit(f"Không đọc được khung hình nào: {reader.info}")
+        time.sleep(0.05)
+
+
+def main():
+    a = parse_args()
     # Luồng YOLO giữ GIL của Python lâu; đổi luồng thường hơn để luồng hiển thị không bị chậm.
     sys.setswitchinterval(0.0005)
     print(f"main.py phien ban: {PHIEN_BAN}")
@@ -826,72 +116,66 @@ def main():
     reader = StreamReader(stream_urls(a.source, a.h264))
     reader.start()
 
-    frame, t0 = None, time.time()
-    while frame is None:
-        frame, _ = reader.get()
-        if frame is None:
-            if time.time() - t0 > 60:
-                reader.running = False
-                sys.exit(f"Không đọc được khung hình nào: {reader.info}")
-            time.sleep(0.05)
+    frame = wait_first_frame(reader)
     h0, w0 = frame.shape[:2]
-    win = "Giai doan 5 - theo doi xe"
+    win = "Smart Unmarked Parking Assistant"
+    ui = Dashboard(os.path.join(HERE, "assets", "ui_bg.png"))
     cv2.namedWindow(win, cv2.WINDOW_NORMAL)
-    cv2.resizeWindow(win, min(1600, w0), int(min(1600, w0) * h0 / w0))
+    cv2.resizeWindow(win, 1440, 810)
+    cv2.setMouseCallback(win, ui.on_mouse)
     lw = max(2, w0 // 640)
     print(f"Khung hinh {w0}x{h0}" + ("" if (w0, h0) == FULL_HD else " - CHUA PHAI FULL HD!"))
     cv2.imwrite(os.path.join(a.out, "khung_dau.jpg"), frame)   # lưu khung đầu để kiểm tra góc máy
 
-    # nhật ký sự kiện: mỗi lần chạy 1 file riêng
-    log_path = os.path.join(a.out, f"{time.strftime('%Y%m%d_%H%M%S')}.csv")
-    log = open(log_path, "w", newline="", encoding="utf-8-sig")
-    logw = csv.writer(log)
-    logw.writerow(["thoi_gian", "khung_hinh", "xe_id", "su_kien", "cong", "day", "x_mm", "y_mm", "ghi_chu"])
-    log.flush()
-    print(f"Nhat ky su kien: {log_path}")
-    holder = {}
-
-    def log_event(car, ev, gate, note):
-        now = time.strftime("%Y-%m-%d %H:%M:%S")
-        row = in_row(car.c)
-        day = "" if row is None else ("tren" if row == 0 else "duoi")
-        logw.writerow([now, holder["det"].n, car.id, ev, gate, day, round(float(car.c[0]), 1),
-                       round(float(car.c[1]), 1), note])
-        log.flush()
-        print(f"[{now}] ID {car.id}: {ev}" + (f" ({gate})" if gate else "") + (f" day {day}" if day else "")
-              + f" x={car.c[0]:.0f} y={car.c[1]:.0f} mm - {note}")
-
-    det = holder["det"] = Detector(model, kw, a, log_event)
+    log = EventLog(a.out)                        # nhật ký sự kiện: mỗi lần chạy 1 file riêng
+    print(f"Nhat ky su kien: {log.path}")
+    det = Detector(model, kw, a, log)
+    log.frame_no = lambda: det.n
     det.paper.update(frame)
     det.paper.update(frame)                      # 2 khung giống nhau = đứng yên -> thử tìm ngay
     print("To giay: " + ("tim thay 4 goc, da khoa khung bai" if det.paper.state == "khoa" else "CHUA THAY, se tim lai moi 1 s"))
+    log.note("Bắt đầu theo dõi bãi xe")
+    log.note("Đã khoá khung bãi theo tờ giấy" if det.paper.state == "khoa" else
+             "Chưa thấy tờ giấy, đang tìm lại mỗi giây", "he_thong" if det.paper.state == "khoa" else "canh_bao")
 
     worker = DetectWorker(det, reader)
     worker.start()
     shown, paused, show_rate = -1, False, Rate()
+    t_start, t_panel, last_info, video = time.time(), 0.0, "Stream OK", None
+    fullscreen = False
     try:
         while True:
-            new = False
-            if not paused:
-                frame, fid = reader.get()
-                new = frame is not None and fid != shown
-                if new:
-                    shown = fid
-                    snap = det.snap
-                    show_rate.tick()
-                    state = snap["state"] if snap else det.paper.state
-                    info = [f"{w0}x{h0} | stream {reader.rate.get():.1f} | hien thi {show_rate.get():.1f}"
-                            f" | YOLO {snap['det_fps'] if snap else 0.0:.1f} FPS | {len(snap['cars']) if snap else 0} xe"
-                            + ("" if (w0, h0) == FULL_HD else " | CHUA FULL HD")
-                            + {"khoa": "", "cho": " | GIAY/MAY XE DICH - CHO ON DINH", "tim": " | DANG TIM TO GIAY"}[state]]
-                    if reader.info != "Stream OK":
-                        info.append(reader.info)
-                    cv2.imshow(win, draw_overlay(frame.copy(), snap, info, lw))
+            frame, fid = reader.get()
+            snap = det.snap
+            new = not paused and frame is not None and fid != shown
+            if new:
+                shown = fid
+                show_rate.tick()
+                video = draw_overlay(frame.copy(), snap, None, lw)
+            if reader.info != last_info:         # mất / có lại kết nối -> ghi vào log
+                last_info = reader.info
+                log.note("Kết nối stream ổn định" if last_info == "Stream OK" else last_info,
+                         "he_thong" if last_info == "Stream OK" else "canh_bao")
+            if time.time() - t_panel > 0.5:     # hai cột thông số: cập nhật 2 lần/giây là đủ
+                t_panel = time.time()
+                state = snap["state"] if snap else det.paper.state
+                ui.set_panel("left", left_items(snap, state, (w0, h0), reader.rate.get(), show_rate.get(),
+                                                gpu, reader.info, paused, time.time() - t_start))
+                ui.set_panel("right", right_items(snap))
+            ui.set_log(*log.entries())
+            if new or ui.dirty:                  # chỉ vẽ lại cửa sổ khi có khung mới hoặc chữ đổi
+                cv2.imshow(win, ui.compose(video))
             k = cv2.waitKey(1 if new else 5) & 0xFF
             if k == ord("q") or cv2.getWindowProperty(win, cv2.WND_PROP_VISIBLE) < 1:
                 break
             if k == ord(" "):
                 paused = worker.paused = not paused
+                log.note("Tạm dừng" if paused else "Tiếp tục theo dõi")
+                t_panel = 0.0
+            if k == ord("f"):
+                fullscreen = not fullscreen
+                cv2.setWindowProperty(win, cv2.WND_PROP_FULLSCREEN,
+                                      cv2.WINDOW_FULLSCREEN if fullscreen else cv2.WINDOW_NORMAL)
     except KeyboardInterrupt:
         pass
     finally:
@@ -901,7 +185,7 @@ def main():
         log.close()
         cv2.destroyAllWindows()
     print(f"Xe da vao: {det.reg.n_in}, da roi: {det.reg.n_out}, dang do: "
-          f"{sum(c.state == 'da_do' for c in det.reg.cars.values())}. Nhat ky: {log_path}")
+          f"{sum(c.state == 'da_do' for c in det.reg.cars.values())}. Nhat ky: {log.path}")
 
 
 if __name__ == "__main__":

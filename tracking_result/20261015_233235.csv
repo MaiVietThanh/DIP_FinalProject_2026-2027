@@ -1,0 +1,23 @@
+﻿thoi_gian,khung_hinh,xe_id,su_kien,cong,day,x_mm,y_mm,ghi_chu
+2026-10-15 23:32:38,4,1,co_san,,tren,36.5,40.4,xe có sẵn khi bắt đầu chạy
+2026-10-15 23:32:38,4,2,co_san,,tren,230.2,42.8,xe có sẵn khi bắt đầu chạy
+2026-10-15 23:32:38,4,3,co_san,,duoi,24.3,131.3,xe có sẵn khi bắt đầu chạy
+2026-10-15 23:32:38,4,4,co_san,,duoi,335.0,135.1,xe có sẵn khi bắt đầu chạy
+2026-10-15 23:32:48,274,1,do,,tren,36.3,40.6,đứng yên 10 s trong dãy trên
+2026-10-15 23:32:48,274,2,do,,tren,230.3,42.8,đứng yên 10 s trong dãy trên
+2026-10-15 23:32:48,274,3,do,,duoi,24.1,131.1,đứng yên 10 s trong dãy dưới
+2026-10-15 23:32:48,274,4,do,,duoi,335.0,135.1,đứng yên 10 s trong dãy dưới
+2026-10-15 23:33:19,1071,5,vao,cong trai,,13.0,207.6,xe mới vào bãi
+2026-10-15 23:33:44,1719,3,roi_cho,,duoi,85.8,128.4,xe đang đỗ được nhấc lên đặt chỗ khác
+2026-10-15 23:33:54,1985,3,do,,duoi,85.9,132.0,đứng yên 10 s trong dãy dưới
+2026-10-15 23:33:54,1987,5,do,,duoi,23.9,131.7,đứng yên 10 s trong dãy dưới
+2026-10-15 23:34:46,3360,3,roi_cho,,duoi,120.6,135.2,xe đang đỗ bị dời khỏi chỗ
+2026-10-15 23:34:48,3401,1,roi_cho,,tren,123.2,41.8,xe đang đỗ được nhấc lên đặt chỗ khác
+2026-10-15 23:34:48,3404,2,roi_cho,,tren,294.8,46.4,xe đang đỗ được nhấc lên đặt chỗ khác
+2026-10-15 23:34:50,3472,6,xuat_hien,,tren,133.2,43.0,xe mới không đi qua ô cam (có thể bị mất dấu quá lâu)
+2026-10-15 23:34:56,3628,3,do,,duoi,121.2,135.4,đứng yên 10 s trong dãy dưới
+2026-10-15 23:35:00,3727,2,do,,tren,295.6,41.0,đứng yên 10 s trong dãy trên
+2026-10-15 23:35:00,3730,6,do,,tren,132.9,42.9,đứng yên 10 s trong dãy trên
+2026-10-15 23:35:01,3740,1,do,,tren,32.3,43.0,đứng yên 10 s trong dãy trên
+2026-10-15 23:35:44,4874,2,roi_cho,,,333.5,-28.8,xe đang đỗ được nhấc lên đặt chỗ khác
+2026-10-15 23:35:58,5266,2,roi_bai,cong phai,,354.2,-27.1,xe rời khỏi bãi
